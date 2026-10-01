@@ -7,6 +7,8 @@ import importlib.util
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -233,6 +235,25 @@ class DevinSyncTest(unittest.TestCase):
         self.assertEqual(json.loads(mod.CONFIG_FILE.read_text())["sync_dir"], str(self.sync.resolve()))
         mod.cmd_uninstall()
         self.assertFalse(mod.LAUNCHER.exists() or mod.SHIM.exists())
+
+    def test_install_from_command_line(self):
+        """`install --sync-dir X` must reach cmd_install (argparse REMAINDER trap)."""
+        entry = self.root / "devin-desktop.desktop"
+        entry.write_text("[Desktop Entry]\nExec=/x/devin-desktop %F\n")
+        binary = self.root / "devin-desktop"
+        binary.write_text("")
+        env = {**os.environ, "HOME": str(self.a), "DEVIN_DESKTOP_BIN": str(binary), "DEVIN_SYNC_NO_NOTIFY": "1"}
+        env.pop("DEVIN_SYNC_DIR", None)
+        env.pop("XDG_CONFIG_HOME", None)
+        # Point the entry lookup at our fake file through a tiny wrapper script.
+        runner = (f"import runpy, sys; sys.argv = {[str(SCRIPT), 'install', '--sync-dir', str(self.sync)]!r};"
+                  f"g = runpy.run_path({str(SCRIPT)!r}, run_name='devin_sync');"
+                  f"g['DESKTOP_ENTRY_CANDIDATES'][:] = [{str(entry)!r}]; g['_refresh_menus'] = lambda: None;"
+                  f"g['main'].__globals__.update(g); g['main']()")
+        r = subprocess.run([sys.executable, "-c", runner], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cfg = json.loads((self.a / ".config/devin-sync/config.json").read_text())
+        self.assertEqual(cfg["sync_dir"], str(self.sync.resolve()))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 — 2026-10-01
+- Fix: `install --sync-dir DIR` ignored the option (it was swallowed by the pass-through
+  arguments). Added a command-line level test.
+
 ## 0.1.0 — 2026-10-01
 - First release: wrapper for Devin Desktop and Devin CLI with pull on start / push on exit.
 - Per-session merge of `sessions.db`, sidebar index rows from `state.vscdb`, ACP message stores,

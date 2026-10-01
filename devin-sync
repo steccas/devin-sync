@@ -40,7 +40,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -655,7 +655,11 @@ def main():
     ap.add_argument("args", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     if a.mode == "install":
-        return cmd_install(a.sync_dir)
+        # Options after the mode land in REMAINDER (meant for Devin's own args): parse them here.
+        ip = argparse.ArgumentParser(prog="devin-sync install")
+        ip.add_argument("--sync-dir")
+        ia = ip.parse_args(a.args)
+        return cmd_install(ia.sync_dir or a.sync_dir)
     if a.mode == "uninstall":
         return cmd_uninstall()
     if a.mode == "status":
