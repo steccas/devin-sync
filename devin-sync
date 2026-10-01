@@ -1,0 +1,680 @@
+#!/usr/bin/env python3
+"""devin-sync — keep local Devin Desktop / Devin CLI sessions in sync between Linux PCs
+through any folder-sync service (Nextcloud, Syncthing, Dropbox, ...).
+
+Devin only syncs *cloud* sessions. Local ones live in SQLite files that must not be
+symlinked into a synced folder (WAL + partial uploads = silent corruption). This wrapper
+instead takes a consistent snapshot when Devin closes and merges it in when Devin opens.
+
+What is synced (local path -> <sync_dir>/data/...):
+  ~/.local/share/devin/cli/sessions.db       sessions.db   session-level merge, newest wins
+  state.vscdb rows 'windsurf.acp.*'          index.json    sidebar index / message-store map
+  ~/.config/Devin/User/acp-messages/*.db     acp-messages/ per-file, newest mtime wins
+  ~/.codeium/windsurf/{cascade,memories}     cascade/ memories/   (legacy Windsurf Cascade chats)
+  ~/.windsurf/plans                          plans/
+  ~/.config/Devin/User/{settings,keybindings}.json, snippets/   user/
+Never synced: the rest of state.vscdb (keyring-encrypted login), Electron profile, caches.
+
+Usage:
+  devin-sync install --sync-dir DIR   once per PC: config, ~/.local/bin shim, menu launcher
+  devin-sync desktop [args]           pull -> run Devin Desktop -> push when every Devin process exits
+  devin-sync cli [args]               same, for the Devin CLI
+  devin-sync sync                     pull + push now (Devin must be closed)
+  devin-sync status                   lock / snapshot / local state
+  devin-sync uninstall                remove shim and launcher override (synced data is kept)
+  --force                             ignore a lock held by another PC
+
+SPDX-License-Identifier: MIT
+"""
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+from contextlib import closing
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+HOME = Path.home()
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state"))
+CONFIG_FILE = XDG_CONFIG / "devin-sync/config.json"
+STATE = XDG_STATE / "devin-sync"
+TMP = HOME / ".cache/devin-sync"
+
+SESSIONS_DB = HOME / ".local/share/devin/cli/sessions.db"
+DEVIN_USER = HOME / ".config/Devin/User"
+VSCDB = DEVIN_USER / "globalStorage/state.vscdb"
+MIGRATION_MARKER = HOME / ".config/Devin/.devin-migration-complete"
+TREES = {
+    "cascade": HOME / ".codeium/windsurf/cascade",
+    "memories": HOME / ".codeium/windsurf/memories",
+    "plans": HOME / ".windsurf/plans",
+    "acp-messages": DEVIN_USER / "acp-messages",
+    "user/snippets": DEVIN_USER / "snippets",
+}
+FILES = {
+    "user/settings.json": DEVIN_USER / "settings.json",
+    "user/keybindings.json": DEVIN_USER / "keybindings.json",
+}
+INDEX_PREFIX = "windsurf.acp."
+INDEX_SKIP = {"windsurf.acp.connectorRegistryCache"}
+
+DESKTOP_CANDIDATES = ["/opt/devin-desktop/devin-desktop", "/usr/share/devin-desktop/devin-desktop",
+                      "/usr/lib/devin-desktop/devin-desktop"]
+DESKTOP_ENTRY_CANDIDATES = ["/usr/share/applications/devin-desktop.desktop",
+                            "/usr/share/applications/devin.desktop"]
+BUNDLED_CLI_REL = "resources/app/extensions/windsurf/devin/bin/devin"
+SHIM = HOME / ".local/bin/devin-sync"
+LAUNCHER = HOME / ".local/share/applications/devin-desktop.desktop"
+
+HOST = socket.gethostname()
+LOCK_WAIT = 90      # seconds to wait for another PC's lock release to sync down
+SNAPSHOT_WAIT = 90  # seconds to wait for a half-downloaded snapshot
+KEEP_BACKUPS = 10
+
+# ---------------------------------------------------------------- messages (en / it)
+
+MESSAGES = {
+    "locked_title": ("Devin is open on another PC", "Devin aperto su un altro PC"),
+    "locked_body": ("Locked by {host} since {since}. Waiting {wait}s for the sync service to deliver its release…",
+                    "Lock di {host} dal {since}. Attendo {wait}s che la sincronizzazione porti la chiusura…"),
+    "not_started_title": ("Devin not started", "Devin non avviato"),
+    "not_started_body": ("Close Devin on {host} and wait for the sync, or run: devin-sync --force desktop",
+                         "Chiudi Devin su {host} e aspetta la sincronizzazione, oppure lancia: devin-sync --force desktop"),
+    "schema_title": ("Different Devin versions", "Versioni di Devin diverse"),
+    "schema_body": ("Local session schema v{lv}, remote v{rv} ({host}): import skipped. Update Devin on every PC.",
+                    "Schema sessioni locale v{lv}, remoto v{rv} ({host}): import saltato. Aggiorna Devin su tutti i PC."),
+    "older_title": ("Devin snapshot not updated", "Snapshot Devin non aggiornato"),
+    "older_body": ("Devin on {host} is older (schema v{lv} < v{rv}): update it.",
+                   "Devin su {host} è più vecchio (schema v{lv} < v{rv}): aggiornalo."),
+    "partial_title": ("Devin snapshot incomplete", "Snapshot Devin incompleto"),
+    "partial_body": ("The sync service has not finished downloading sessions.db: import skipped, "
+                     "it will be retried on next start.",
+                     "La sincronizzazione non ha finito di scaricare sessions.db: import saltato, "
+                     "riprovo al prossimo avvio."),
+    "pull_failed_title": ("Devin import failed", "Import Devin non riuscito"),
+    "pull_failed_body": ("{err}. Starting Devin with local data.", "{err}. Avvio Devin con i dati locali."),
+    "error_title": ("devin-sync error", "Errore devin-sync"),
+    "noconfig_title": ("devin-sync not configured", "devin-sync non configurato"),
+    "noconfig_body": ("Starting Devin without sync. Run: devin-sync install --sync-dir <folder>",
+                      "Avvio Devin senza sync. Lancia: devin-sync install --sync-dir <cartella>"),
+}
+LANG_IT = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "").startswith("it")
+
+
+def msg(key, **kw):
+    return MESSAGES[key][1 if LANG_IT else 0].format(**kw)
+
+
+# ---------------------------------------------------------------- config
+
+def load_config():
+    cfg = {}
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        pass
+    if os.environ.get("DEVIN_SYNC_DIR"):
+        cfg["sync_dir"] = os.environ["DEVIN_SYNC_DIR"]
+    if os.environ.get("DEVIN_DESKTOP_BIN"):
+        cfg["desktop_bin"] = os.environ["DEVIN_DESKTOP_BIN"]
+    return cfg
+
+
+CFG = load_config()
+
+
+def sync_dir():
+    if not CFG.get("sync_dir"):
+        sys.exit("devin-sync: no sync folder configured. Run: devin-sync install --sync-dir <folder>\n"
+                 "            (or set DEVIN_SYNC_DIR)")
+    return Path(os.path.expanduser(CFG["sync_dir"]))
+
+
+def data_dir():
+    return sync_dir() / "data"
+
+
+def lock_file():
+    return sync_dir() / "lock.json"
+
+
+def meta_file():
+    return data_dir() / "meta.json"
+
+
+def desktop_bin():
+    if CFG.get("desktop_bin"):
+        return CFG["desktop_bin"]
+    found = shutil.which("devin-desktop")
+    if found:
+        return os.path.realpath(found)
+    for c in DESKTOP_CANDIDATES:
+        if Path(c).exists():
+            return c
+    return None
+
+
+def desktop_root():
+    b = desktop_bin()
+    return str(Path(b).resolve().parent) + "/" if b else None
+
+
+# ---------------------------------------------------------------- helpers
+
+def log(text):
+    print(f"devin-sync: {text}", file=sys.stderr)
+    try:  # launched from the menu there is no terminal: keep a log per PC
+        STATE.mkdir(parents=True, exist_ok=True)
+        with open(STATE / "devin-sync.log", "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+    except OSError:
+        pass
+
+
+def notify(title, body, urgent=False):
+    log(f"{title} — {body}")
+    if shutil.which("notify-send") and not os.environ.get("DEVIN_SYNC_NO_NOTIFY"):
+        subprocess.run(["notify-send", "-a", "Devin Sync", "-i", "devin-desktop",
+                        "-u", "critical" if urgent else "normal", title, body],
+                       stderr=subprocess.DEVNULL, check=False)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def tmp_for(dst):
+    """Temp path on the same filesystem as dst, so os.replace stays atomic."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    TMP.mkdir(parents=True, exist_ok=True)
+    base = TMP if os.stat(TMP).st_dev == os.stat(dst.parent).st_dev else dst.parent
+    return base / f".{dst.name}.{os.getpid()}.devin-sync-tmp"
+
+
+def write_json_atomic(path, obj):
+    tmp = tmp_for(path)
+    tmp.write_text(json.dumps(obj, indent=1, ensure_ascii=False))
+    os.replace(tmp, path)
+
+
+def copy_atomic(src, dst):
+    tmp = tmp_for(dst)
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+
+
+def drop_sidecars(db):
+    for suffix in ("-wal", "-shm", "-journal"):
+        Path(f"{db}{suffix}").unlink(missing_ok=True)
+
+
+def sqlite_snapshot(src, dst):
+    """Consistent copy of a (possibly WAL-mode) SQLite db, sidecars folded in."""
+    tmp = tmp_for(dst)
+    tmp.unlink(missing_ok=True)
+    s = sqlite3.connect(src)
+    d = sqlite3.connect(tmp)
+    try:
+        s.backup(d)
+        # Rollback-journal mode: readers of the copy (here or on another PC) then never
+        # create -wal/-shm sidecars next to it. Devin switches back to WAL when it opens it.
+        d.execute("PRAGMA journal_mode=DELETE")
+    finally:
+        d.close()
+        s.close()
+    drop_sidecars(tmp)
+    os.replace(tmp, dst)
+
+
+def devin_pids():
+    """PIDs of Devin Desktop (Electron + children) and of any `devin` CLI binary."""
+    root = desktop_root()
+    pids = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            exe = os.readlink(entry / "exe")
+        except OSError:
+            continue
+        if (root and exe.startswith(root)) or os.path.basename(exe) == "devin":
+            pids.append(int(entry.name))
+    return pids
+
+
+# ---------------------------------------------------------------- lock
+
+def acquire_lock(force):
+    deadline = time.time() + LOCK_WAIT
+    warned = False
+    while True:
+        lock = read_json(lock_file())
+        if not lock or lock.get("host") == HOST or force:
+            break  # free, ours (stale after a crash/logout), or forced
+        if not warned:
+            notify(msg("locked_title"), msg("locked_body", host=lock.get("host"),
+                                            since=lock.get("since"), wait=LOCK_WAIT))
+            warned = True
+        if time.time() > deadline:
+            notify(msg("not_started_title"), msg("not_started_body", host=lock.get("host")), urgent=True)
+            sys.exit(2)
+        time.sleep(3)
+    write_json_atomic(lock_file(), {"host": HOST, "pid": os.getpid(),
+                                    "since": time.strftime("%Y-%m-%d %H:%M:%S")})
+
+
+def release_lock():
+    lock = read_json(lock_file())
+    if lock and lock.get("host") == HOST:
+        lock_file().unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- sessions.db merge
+
+def _session_tables(con, schema):
+    """{table: (key_column, [columns to copy])} for every per-session table in `schema`."""
+    has_seq = con.execute(f"SELECT 1 FROM {schema}.sqlite_master WHERE name='sqlite_sequence'").fetchone()
+    autoinc = {r[0] for r in con.execute(f"SELECT name FROM {schema}.sqlite_sequence")} if has_seq else set()
+    out = {}
+    for (t,) in con.execute(f"SELECT name FROM {schema}.sqlite_master WHERE type='table'"):
+        info = con.execute(f'PRAGMA {schema}.table_info("{t}")').fetchall()
+        names = [c[1] for c in info]
+        key = "id" if t == "sessions" else "session_id" if "session_id" in names else None
+        if key is None:
+            continue
+        # Skip AUTOINCREMENT row ids: they are only meaningful inside one file.
+        cols = [c[1] for c in info if not (t in autoinc and c[5] == 1 and c[2].upper() == "INTEGER")]
+        out[t] = (key, cols)
+    return out
+
+
+def schema_version(db):
+    try:
+        with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as c:
+            return c.execute("SELECT max(version) FROM refinery_schema_history").fetchone()[0]
+    except sqlite3.Error:
+        return None
+
+
+def merge_sessions(local, remote):
+    """Merge remote sessions into local, per session; newer last_activity_at wins.
+    Returns the set of session ids taken from remote."""
+    if not local.exists():
+        local.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(remote, local)
+        with closing(sqlite3.connect(remote)) as r:
+            return {row[0] for row in r.execute("SELECT id FROM sessions")}
+    con = sqlite3.connect(local)
+    try:
+        con.execute("ATTACH DATABASE ? AS r", (str(remote),))
+        lt, rt = _session_tables(con, "main"), _session_tables(con, "r")
+        loc = dict(con.execute("SELECT id, last_activity_at FROM main.sessions"))
+        rem = dict(con.execute("SELECT id, last_activity_at FROM r.sessions"))
+        take = {sid for sid, ts in rem.items() if sid not in loc or ts > loc[sid]}
+        if not take:
+            return set()
+        children = [t for t in lt if t != "sessions" and t in rt]
+        with con:
+            for sid in take:
+                for t in children + ["sessions"]:
+                    con.execute(f'DELETE FROM main."{t}" WHERE {lt[t][0]}=?', (sid,))
+                for t in ["sessions"] + children:  # parent row first
+                    cols = [c for c in lt[t][1] if c in rt[t][1]]
+                    cl = ", ".join(f'"{c}"' for c in cols)
+                    con.execute(f'INSERT INTO main."{t}" ({cl}) SELECT {cl} FROM r."{t}" '
+                                f'WHERE {rt[t][0]}=?', (sid,))
+        return take
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------- state.vscdb index rows
+
+def read_index():
+    if not VSCDB.exists():
+        return {}
+    con = sqlite3.connect(f"file:{VSCDB}?mode=ro", uri=True)
+    try:
+        rows = con.execute("SELECT key, value FROM ItemTable WHERE key LIKE ?", (INDEX_PREFIX + "%",))
+        return {k: v for k, v in rows if k not in INDEX_SKIP and isinstance(v, str)}
+    finally:
+        con.close()
+
+
+def write_index(remote_rows, taken):
+    """Insert remote rows missing locally; overwrite those of sessions taken from remote."""
+    if not remote_rows or not VSCDB.exists():
+        return
+    local = read_index()
+    upd = {k: v for k, v in remote_rows.items()
+           if k not in local or any(k.endswith("/" + sid) for sid in taken)}
+    if not upd:
+        return
+    con = sqlite3.connect(VSCDB)
+    try:
+        with con:
+            con.executemany("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)", upd.items())
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------- plain files
+
+def iter_files(root):
+    if root.is_dir():
+        for p in root.rglob("*"):
+            if p.is_file() and not p.name.endswith(("-wal", "-shm", "-journal")):
+                yield p.relative_to(root)
+
+
+def copy_newer(src_root, dst_root, sqlite_dir=False):
+    n = 0
+    for rel in iter_files(src_root):
+        s, d = src_root / rel, dst_root / rel
+        if d.exists() and d.stat().st_mtime >= s.stat().st_mtime:
+            continue
+        if sqlite_dir and s.suffix == ".db":
+            if Path(f"{s}-wal").exists():
+                sqlite_snapshot(s, d)
+                os.utime(d, (s.stat().st_atime, s.stat().st_mtime))
+            else:
+                copy_atomic(s, d)
+            drop_sidecars(d)
+        else:
+            copy_atomic(s, d)
+        n += 1
+    return n
+
+
+# ---------------------------------------------------------------- pull / push
+
+def backup_local():
+    dest = STATE / "backups" / time.strftime("%Y%m%d-%H%M%S")
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in [SESSIONS_DB, Path(f"{SESSIONS_DB}-wal"), Path(f"{SESSIONS_DB}-shm"), VSCDB]:
+        if f.exists():
+            shutil.copy2(f, dest / f.name)
+    if TREES["acp-messages"].is_dir():
+        shutil.copytree(TREES["acp-messages"], dest / "acp-messages", dirs_exist_ok=True)
+    olds = sorted((STATE / "backups").iterdir())
+    for old in olds[:-KEEP_BACKUPS]:
+        shutil.rmtree(old, ignore_errors=True)
+    return dest
+
+
+def fetch_snapshot():
+    """Local copy of the remote sessions.db, verified against meta.json, or None."""
+    remote = data_dir() / "sessions.db"
+    if not meta_file().exists() or not remote.exists():
+        return None
+    deadline = time.time() + SNAPSHOT_WAIT
+    while True:
+        meta = read_json(meta_file(), {})
+        TMP.mkdir(parents=True, exist_ok=True)
+        tmp = TMP / "remote-sessions.db"
+        shutil.copy2(remote, tmp)
+        if sha256(tmp) == meta.get("sha256"):
+            return tmp
+        if time.time() > deadline:
+            notify(msg("partial_title"), msg("partial_body"), urgent=True)
+            return None
+        time.sleep(3)
+
+
+def drop_sidecars_if_orphan(db):
+    """A -wal next to a missing db would be replayed into whatever db appears later."""
+    if not db.exists():
+        drop_sidecars(db)
+
+
+def pull():
+    meta = read_json(meta_file())
+    if not meta:
+        log("no remote snapshot yet: nothing to import")
+        return
+    if devin_pids():
+        log("Devin is running: pull skipped")
+        return
+    data = data_dir()
+    backup_local()
+    snap = fetch_snapshot()
+    taken, merged = set(), False
+    if snap:
+        drop_sidecars_if_orphan(SESSIONS_DB)
+        lv = schema_version(SESSIONS_DB) if SESSIONS_DB.exists() else None
+        rv = schema_version(snap)
+        if lv is not None and lv != rv:
+            notify(msg("schema_title"), msg("schema_body", lv=lv, rv=rv, host=meta.get("host")), urgent=True)
+        else:
+            taken = merge_sessions(SESSIONS_DB, snap)
+            merged = True
+        snap.unlink(missing_ok=True)
+    if merged:  # index rows without their sessions would show ghost chats
+        write_index(read_json(data / "index.json", {}), taken)
+    n = sum(copy_newer(data / rel, local, sqlite_dir=(rel == "acp-messages")) for rel, local in TREES.items())
+    for rel, local in FILES.items():
+        r = data / rel
+        if r.exists() and (not local.exists() or r.stat().st_mtime > local.stat().st_mtime):
+            copy_atomic(r, local)
+            n += 1
+    log(f"pull from {meta.get('host')} ({meta.get('time')}): {len(taken)} sessions imported, {n} files updated")
+
+
+def push():
+    if devin_pids():
+        log("Devin is running: push skipped")
+        return False
+    data = data_dir()
+    remote_db = data / "sessions.db"
+    lv = schema_version(SESSIONS_DB) if SESSIONS_DB.exists() else None
+    rv = schema_version(remote_db) if remote_db.exists() else None
+    if lv is not None and rv is not None and lv < rv:
+        # This PC runs an older Devin: don't replace the newer snapshot (it was not merged in).
+        notify(msg("older_title"), msg("older_body", host=HOST, lv=lv, rv=rv), urgent=True)
+    elif SESSIONS_DB.exists():
+        sqlite_snapshot(SESSIONS_DB, remote_db)
+    index = read_json(data / "index.json", {})
+    index.update(read_index())
+    write_json_atomic(data / "index.json", index)
+    n = 0
+    for rel, local in TREES.items():
+        n += copy_newer(local, data / rel, sqlite_dir=(rel == "acp-messages"))
+    for rel, local in FILES.items():
+        r = data / rel
+        if local.exists() and (not r.exists() or local.stat().st_mtime > r.stat().st_mtime):
+            copy_atomic(local, r)
+            n += 1
+    count = 0
+    if remote_db.exists():
+        with closing(sqlite3.connect(f"file:{remote_db}?mode=ro", uri=True)) as c:
+            count = c.execute("SELECT count(*) FROM sessions").fetchone()[0]
+    write_json_atomic(meta_file(), {  # written last: its sha256 marks the snapshot complete
+        "host": HOST, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "version": 1,
+        "sha256": sha256(remote_db) if remote_db.exists() else None,
+        "sessions": count, "devin_sync": __version__,
+    })
+    log(f"push: {count} sessions, {n} files updated")
+    return True
+
+
+# ---------------------------------------------------------------- run modes
+
+def cli_binary():
+    me = Path(sys.argv[0]).resolve()
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        p = Path(d) / "devin"
+        if p.is_file() and os.access(p, os.X_OK) and p.resolve() != me:
+            return str(p)
+    root = desktop_root()
+    if root and Path(root, BUNDLED_CLI_REL).exists():
+        return str(Path(root, BUNDLED_CLI_REL))
+    sys.exit("devin-sync: Devin CLI not found (neither on PATH nor bundled with Devin Desktop)")
+
+
+def run_wrapped(cmd, force, foreground):
+    if not CFG.get("sync_dir"):
+        # Never leave a menu launcher dead: warn and run Devin unwrapped.
+        notify(msg("noconfig_title"), msg("noconfig_body"), urgent=True)
+        os.execv(cmd[0], cmd)
+    if devin_pids():
+        # Devin already running here: whoever started it owns lock and final push.
+        os.execv(cmd[0], cmd)
+    acquire_lock(force)
+    stop = {"sig": False}
+
+    def on_signal(signum, _frame):
+        stop["sig"] = True  # logout/shutdown: keep going, try to push once Devin is gone
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, on_signal)
+    try:
+        try:
+            pull()
+        except Exception as e:  # noqa: BLE001 — local data is untouched; next sync retries
+            notify(msg("pull_failed_title"), msg("pull_failed_body", err=f"{type(e).__name__}: {e}"), urgent=True)
+        if foreground:
+            child = subprocess.Popen(cmd)
+            # Ctrl+C belongs to the CLI; ignore it here only after spawning, or the
+            # child would inherit SIG_IGN through exec.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        else:
+            child = subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL)
+        child.wait()
+        # Electron and the ACP child can outlive the launcher; wait for all of them.
+        waited, grace = 0, (10 if stop["sig"] else None)
+        while devin_pids():
+            if waited == 0 and foreground:
+                log("other Devin processes still running: syncing when they exit…")
+            time.sleep(2)
+            waited += 2
+            if grace and waited >= grace:
+                log("system shutdown with Devin still alive: push skipped")
+                return
+        time.sleep(1)  # let SQLite finish closing files
+        if push():
+            release_lock()
+    except Exception as e:  # noqa: BLE001 — never leave the user without a notification
+        notify(msg("error_title"), f"{type(e).__name__}: {e}", urgent=True)
+        raise
+
+
+def cmd_status():
+    print(f"devin-sync {__version__}")
+    print(f"host:          {HOST}")
+    print(f"config:        {CONFIG_FILE} {'' if CONFIG_FILE.exists() else '(missing)'}")
+    print(f"sync dir:      {sync_dir()}")
+    print(f"desktop:       {desktop_bin() or 'not found'}")
+    print(f"lock:          {read_json(lock_file()) or 'free'}")
+    print(f"snapshot:      {read_json(meta_file()) or 'none'}")
+    print(f"devin pids:    {devin_pids() or 'none'}")
+    if SESSIONS_DB.exists():
+        with closing(sqlite3.connect(f"file:{SESSIONS_DB}?mode=ro", uri=True)) as con:
+            n = con.execute("SELECT count(*) FROM sessions").fetchone()[0]
+        print(f"local:         {n} sessions in {SESSIONS_DB}")
+    print(f"index:         {len(read_index())} windsurf.acp.* rows in state.vscdb")
+    print(f"launcher:      {'override active' if LAUNCHER.exists() else 'NOT installed (devin-sync install)'}")
+
+
+def _refresh_menus():
+    for tool in (["update-desktop-database", str(LAUNCHER.parent)], ["kbuildsycoca6"], ["kbuildsycoca5"]):
+        if shutil.which(tool[0]):
+            subprocess.run(tool, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def cmd_install(sync_dir_arg):
+    me = Path(__file__).resolve()
+    cfg = read_json(CONFIG_FILE, {})
+    if sync_dir_arg:
+        cfg["sync_dir"] = str(Path(os.path.expanduser(sync_dir_arg)).resolve())
+    if not cfg.get("sync_dir"):
+        sys.exit("devin-sync: pass --sync-dir <folder inside Nextcloud/Syncthing/Dropbox/...>")
+    b = desktop_bin()
+    entry = next((Path(p) for p in DESKTOP_ENTRY_CANDIDATES if Path(p).exists()), None)
+    if not b or not entry:
+        sys.exit("devin-sync: Devin Desktop not found; install it or set DEVIN_DESKTOP_BIN")
+    if not MIGRATION_MARKER.exists() and (HOME / ".config/Windsurf").exists():
+        sys.exit("devin-sync: the Windsurf -> Devin migration has not run on this PC yet.\n"
+                 "            Open Devin Desktop once normally, close it, then run install again.")
+    Path(cfg["sync_dir"]).mkdir(parents=True, exist_ok=True)
+    write_json_atomic(CONFIG_FILE, cfg)
+    # Shim instead of a symlink: synced folders may not keep the executable bit.
+    SHIM.parent.mkdir(parents=True, exist_ok=True)
+    if SHIM.is_symlink() or SHIM.exists():
+        SHIM.unlink()
+    SHIM.write_text(f'#!/bin/sh\nexec /usr/bin/env python3 "{me}" "$@"\n')
+    SHIM.chmod(0o755)
+    LAUNCHER.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for line in entry.read_text().splitlines():
+        if line.startswith("Exec="):  # swap the binary, keep its arguments (%F, --new-window, ...)
+            args = line[len("Exec="):].split(" ", 1)[1:]
+            line = " ".join([f"Exec={SHIM} desktop", *args])
+        lines.append(line)
+    LAUNCHER.write_text("\n".join(lines) + "\n")
+    _refresh_menus()
+    print(f"config:   {CONFIG_FILE} (sync_dir = {cfg['sync_dir']})")
+    print(f"shim:     {SHIM} -> {me}")
+    print(f"launcher: {LAUNCHER} (the devin:// URL handler is left untouched)")
+
+
+def cmd_uninstall():
+    for p in (SHIM, LAUNCHER):
+        if p.is_symlink() or p.exists():
+            p.unlink()
+            print(f"removed {p}")
+    _refresh_menus()
+    print(f"kept: {CONFIG_FILE}, {STATE} (backups), and the synced data")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="devin-sync",
+                                 description="Sync local Devin Desktop/CLI sessions between PCs via a synced folder")
+    ap.add_argument("--force", action="store_true", help="ignore a lock held by another PC")
+    ap.add_argument("--sync-dir", help="(install) folder inside your sync service")
+    ap.add_argument("--version", action="version", version=f"devin-sync {__version__}")
+    ap.add_argument("mode", choices=["desktop", "cli", "sync", "status", "install", "uninstall"])
+    ap.add_argument("args", nargs=argparse.REMAINDER)
+    a = ap.parse_args()
+    if a.mode == "install":
+        return cmd_install(a.sync_dir)
+    if a.mode == "uninstall":
+        return cmd_uninstall()
+    if a.mode == "status":
+        return cmd_status()
+    if a.mode == "desktop":
+        b = desktop_bin()
+        if not b:
+            sys.exit("devin-sync: Devin Desktop not found; set DEVIN_DESKTOP_BIN")
+        run_wrapped([b, *a.args], a.force, foreground=None)
+    elif a.mode == "cli":
+        run_wrapped([cli_binary(), *a.args], a.force, foreground="cli")
+    elif a.mode == "sync":
+        if devin_pids():
+            sys.exit("devin-sync: close Devin before syncing")
+        acquire_lock(a.force)
+        pull()
+        if push():
+            release_lock()
+
+
+if __name__ == "__main__":
+    main()
